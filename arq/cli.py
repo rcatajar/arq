@@ -10,7 +10,7 @@ from pydantic.utils import import_string
 
 from .logs import default_log_config
 from .version import VERSION
-from .worker import check_health, create_worker, run_worker
+from .worker import Worker, check_health, create_worker, run_worker
 
 if TYPE_CHECKING:
     from .typing import WorkerSettingsType
@@ -43,12 +43,12 @@ def cli(*, worker_settings: str, burst: bool, check: bool, watch: str, verbose: 
     else:
         kwargs = {} if burst is None else {'burst': burst}
         if watch:
-            asyncio.run(watch_reload(watch, worker_settings_))
+            asyncio.run(watch_reload(watch, worker_settings))
         else:
             run_worker(worker_settings_, **kwargs)
 
 
-async def watch_reload(path: str, worker_settings: 'WorkerSettingsType') -> None:
+async def watch_reload(path: str, worker_settings: str) -> None:
     try:
         from watchgod import awatch
     except ImportError as e:  # pragma: no cover
@@ -61,14 +61,26 @@ async def watch_reload(path: str, worker_settings: 'WorkerSettingsType') -> None
         if s != Signals.SIGUSR1:  # pragma: no cover
             stop_event.set()
 
-    worker = create_worker(worker_settings)
-    try:
+    def _setup_worker() -> Worker:
+        from importlib import invalidate_caches
+
+        invalidate_caches()
+        settings = import_string(worker_settings)
+        worker_settings_ = cast("WorkerSettingsType", settings)
+        logger = logging.getLogger('arq.worker')
+        logger.info(settings.functions)
+        worker = create_worker(worker_settings_)
         worker.on_stop = worker_on_stop
+        return worker
+
+    worker = _setup_worker()
+    try:
         loop.create_task(worker.async_run())
         async for _ in awatch(path, stop_event=stop_event):
             print('\nfiles changed, reloading arq worker...')
             worker.handle_sig(Signals.SIGUSR1)
             await worker.close()
+            worker = _setup_worker()
             loop.create_task(worker.async_run())
     finally:
         await worker.close()
